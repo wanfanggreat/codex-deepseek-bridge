@@ -157,8 +157,39 @@ def shape(value, depth=0):
     return type(value).__name__
 
 
-def tool_definitions(tools):
-    result, mapping = [], {}
+def tool_wire_names(identities):
+    """Keep ordinary names; deterministically alias long or ambiguous names."""
+    prefix = 'dsbridge_'
+    candidates, groups = {}, {}
+    for namespace, name in identities:
+        if not isinstance(name, str) or not name:
+            raise ProtocolError('Responses tool name must be a non-empty string')
+        if namespace is not None and (not isinstance(namespace, str) or not namespace):
+            raise ProtocolError('Responses tool namespace must be a non-empty string')
+        identity = (namespace, name)
+        wire = ((namespace + '__') if namespace else '') + name
+        candidates[identity] = wire
+        groups.setdefault(wire, set()).add(identity)
+    names, allocated = {}, {}
+    for identity, candidate in candidates.items():
+        wire = candidate
+        if (not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', wire)
+                or wire.startswith(prefix) or len(groups[wire]) > 1):
+            # Hash the structured identity, not the flattened name: two
+            # namespaces can flatten to the same string. Reserve the prefix
+            # so a real tool named like an alias cannot shadow another tool.
+            digest = hashlib.sha256(json.dumps(identity, ensure_ascii=True).encode()).hexdigest()[:32]
+            readable = re.sub(r'[^A-Za-z0-9_-]', '_', candidate)[:22]
+            wire = prefix + readable + '_' + digest
+        if wire in allocated and allocated[wire] != identity:
+            raise ProtocolError('Chat tool alias collision')
+        names[identity] = wire
+        allocated[wire] = identity
+    return names
+
+
+def tool_definitions(tools, extra_identities=()):
+    result, mapping, definitions, seen = [], {}, [], set()
 
     def add(tool, namespace=None):
         kind = tool.get('type')
@@ -174,9 +205,21 @@ def tool_definitions(tools):
         if kind not in ('function', 'custom'):
             raise ProtocolError('Unsupported Responses tool type: ' + str(kind))
         name = tool['name']
-        wire = ((namespace + '__') if namespace else '') + name
-        if len(wire) > 64 or wire in mapping:
-            raise ProtocolError('Unsupported or duplicate tool name')
+        identity = (namespace, name)
+        # Validate before using the identity in a set.
+        tool_wire_names([identity])
+        if identity in seen:
+            raise ProtocolError('Duplicate Responses tool definition: ' +
+                                ((namespace + '.') if namespace else '') + name)
+        seen.add(identity)
+        definitions.append((tool, namespace))
+
+    for tool in tools:
+        add(tool)
+    names = tool_wire_names(list(seen) + list(extra_identities))
+    for tool, namespace in definitions:
+        name, kind = tool['name'], tool['type']
+        wire = names[(namespace, name)]
         meta = {'name': name, 'type': kind}
         if namespace:
             meta['namespace'] = namespace
@@ -188,16 +231,24 @@ def tool_definitions(tools):
         result.append({'type': 'function', 'function': {
             'name': wire, 'description': tool.get('description', ''), 'parameters': params}})
 
-    for tool in tools:
-        add(tool)
     return result, mapping
 
 
 def to_chat(body, upstream_model, max_output):
     if body.get('previous_response_id'):
         raise ProtocolError('Stateful continuation is unsupported; use full HTTP input replay')
-    tools, mapping = tool_definitions(body.get('tools', []))
-    reverse = {(v.get('namespace'), v['name']): k for k, v in mapping.items()}
+    items = body.get('input', [])
+    if isinstance(items, str):
+        items = [{'type': 'message', 'role': 'user', 'content': items}]
+    # Historical calls still need valid names when a later request omits their
+    # definitions (including a compaction request with tools disabled).
+    identities = [(i.get('namespace'), i['name']) for i in items
+                  if i.get('type') in ('function_call', 'custom_tool_call')]
+    choice = body.get('tool_choice', 'auto')
+    if isinstance(choice, dict):
+        identities.append((choice.get('namespace'), choice['name']))
+    tools, mapping = tool_definitions(body.get('tools', []), identities)
+    reverse = tool_wire_names([(v.get('namespace'), v['name']) for v in mapping.values()] + identities)
     messages, pending_reasoning = [], ''
 
     def assistant_message(content='', reasoning=''):
@@ -215,9 +266,6 @@ def to_chat(body, upstream_model, max_output):
 
     if body.get('instructions'):
         messages.append({'role': 'system', 'content': body['instructions']})
-    items = body.get('input', [])
-    if isinstance(items, str):
-        items = [{'type': 'message', 'role': 'user', 'content': items}]
     for item in items:
         kind = item.get('type', 'message')
         if kind == 'message':
