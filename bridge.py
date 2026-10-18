@@ -29,6 +29,29 @@ class ProtocolError(ValueError):
     pass
 
 
+class CompactionError(ProtocolError):
+    """A failed summary must leave the original history intact."""
+
+
+COMPACTION_MAX_OUTPUT = 16384
+COMPACTION_INSTRUCTIONS = (
+    'Perform context compaction only. Do not continue the task or call tools. '
+    'Write a concise, self-contained handoff, targeting 2000 tokens and no more than 3000 tokens. '
+    'Prioritize the latest user objective and constraints, current file ownership, exact working paths '
+    'and revisions, verified changes and test outcomes, unfinished work, blockers, and the next actions. '
+    'Preserve unique identifiers and facts needed to continue, but combine repeated facts and summarize '
+    'completed phases briefly. Omit raw logs, source code, full diffs, repeated commands, and obsolete plans. '
+    'Distinguish verified facts from guesses. Return only the visible handoff summary; do not reveal private reasoning.'
+)
+COMPACTION_RETRY_INSTRUCTIONS = (
+    'The previous handoff did not finish within its output budget or returned no visible summary. '
+    'Start a new, shorter handoff from the original history above. Target 1200 tokens, at most 2000 tokens. '
+    'Keep the active objective, binding constraints, current paths/revisions, verified state and next actions. '
+    'Compress older completed work to brief references. Do not repeat the previous draft or continue the task. '
+    'Return a complete visible summary only, without tools, raw logs, code, or private reasoning.'
+)
+
+
 class ContextStore:
     """Private local summaries addressed by random, model-bound opaque tokens."""
     prefix = 'dsctx_v1_'
@@ -90,16 +113,11 @@ def prepare_context(body, store, model):
             raise ProtocolError('A context store is required for DeepSeek compaction')
         result['tools'] = []
         result['tool_choice'] = 'none'
-        items.append({'type': 'message', 'role': 'user', 'content':
-            'Perform context compaction only. Do not continue the task or call tools. '
-            'Write a self-contained handoff summary preserving the actual objective, constraints, '
-            'completed and pending work, exact paths and identifiers, verified evidence, unresolved '
-            'issues, and important facts or markers needed to continue. Distinguish facts from guesses. '
-            'Return only this summary; do not reveal private reasoning.'})
+        items.append({'type': 'message', 'role': 'user', 'content': COMPACTION_INSTRUCTIONS})
     return result, compact
 
 
-def compact_events(upstream, model, mapping, store):
+def compact_events(upstream, model, mapping, store, retry=None, audit=None):
     """Adapt Chat summarization to native Responses V2 compaction events."""
     identity = 'resp_' + uuid.uuid4().hex
     response = {'id': identity, 'object': 'response', 'created_at': int(time.time()),
@@ -107,21 +125,41 @@ def compact_events(upstream, model, mapping, store):
                 'usage': None, 'error': None, 'incomplete_details': None}
     yield {'type': 'response.created', 'sequence_number': 0, 'response': dict(response)}
     yield {'type': 'response.in_progress', 'sequence_number': 1, 'response': dict(response)}
-    final = None
     last_heartbeat = time.monotonic()
-    for event in relay_events(upstream, model, mapping):
-        if time.monotonic() - last_heartbeat >= 10:
-            yield {'type': 'keepalive'}
-            last_heartbeat = time.monotonic()
-        if event['type'] in ('response.completed', 'response.incomplete'):
-            final = event['response']
+
+    def collect(stream, attempt):
+        nonlocal last_heartbeat
+        final = None
+        for event in relay_events(stream, model, mapping):
+            if time.monotonic() - last_heartbeat >= 10:
+                yield {'type': 'keepalive'}
+                last_heartbeat = time.monotonic()
+            if event['type'] in ('response.completed', 'response.incomplete'):
+                final = event['response']
+        if final and audit:
+            audit(route='deepseek_compaction_attempt', model=model, attempt=attempt,
+                  status=final['status'], usage=final.get('usage'),
+                  incomplete_reason=(final.get('incomplete_details') or {}).get('reason'),
+                  summary_characters=sum(len(text_content(i.get('content')))
+                                         for i in final['output'] if i['type'] == 'message'))
+        return final
+
+    final = yield from collect(upstream, 1)
+    empty = final and not any(
+        text_content(i.get('content')).strip() for i in final['output'] if i['type'] == 'message')
+    if retry and final and (final['status'] == 'incomplete' or empty):
+        # No partial draft is persisted or sent to Codex. Retry once against
+        # the same original history, with a shorter handoff instruction.
+        yield {'type': 'keepalive'}
+        with retry() as repeated:
+            final = yield from collect(repeated, 2)
     if not final or final['status'] != 'completed':
-        raise ProtocolError('DeepSeek compaction was truncated; original context was not compacted')
+        raise CompactionError('DeepSeek compaction exceeded its summary output limit; original context was not compacted')
     if any(i['type'] not in ('message', 'reasoning') for i in final['output']):
-        raise ProtocolError('DeepSeek compaction attempted a tool call')
+        raise CompactionError('DeepSeek compaction attempted a tool call; original context was not compacted')
     summary = '\n'.join(text_content(i.get('content')) for i in final['output'] if i['type'] == 'message').strip()
     if not summary:
-        raise ProtocolError('DeepSeek compaction returned no summary')
+        raise CompactionError('DeepSeek compaction returned no visible summary; original context was not compacted')
     token = store.put(model, summary)
     item = {'type': 'compaction', 'id': 'cmp_' + uuid.uuid4().hex, 'encrypted_content': token}
     yield {'type': 'response.output_item.added', 'sequence_number': 2, 'output_index': 0, 'item': dict(item)}
@@ -527,6 +565,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         begun = time.monotonic()
         streamed = False
+        stream_response, stream_sequence = None, -1
         try:
             size = int(self.headers.get('Content-Length', 0))
             if not 0 < size <= 32 * 1024 * 1024:
@@ -541,6 +580,10 @@ class Handler(BaseHTTPRequestHandler):
                     raise ProtocolError('DeepSeek server-side compaction is unsupported')
                 prepared, compact = prepare_context(body, getattr(self.server, 'context_store', None), self.server.model)
                 chat, mapping = to_chat(prepared, self.server.model, self.server.max_output)
+                if compact:
+                    # Summary generation has its own budget; changing it must
+                    # not enlarge ordinary task replies or their user limits.
+                    chat['max_tokens'] = getattr(self.server, 'max_compaction_output', COMPACTION_MAX_OUTPUT)
                 # Construct relay headers from scratch. ChatGPT auth/identity never crosses this branch.
                 headers = {'Authorization': 'Bearer ' + self.server.api_key,
                            'Content-Type': 'application/json', 'Accept': 'text/event-stream',
@@ -552,10 +595,21 @@ class Handler(BaseHTTPRequestHandler):
                            reasoning_effort_forwarded=chat['reasoning_effort'],
                            thinking_type=chat['thinking']['type'],
                            compaction_request=compact,
+                           max_output_tokens=chat['max_tokens'],
                            excluded_hosted_tools=[t['type'] for t in body.get('tools', []) if t.get('type') in ('web_search', 'web_search_preview')],
                            upstream='chat/completions', chatgpt_headers_forwarded=False)
+
+                def retry_summary():
+                    retry_chat = dict(chat)
+                    retry_chat['messages'] = chat['messages'][:-1] + [
+                        {'role': 'user', 'content': COMPACTION_RETRY_INSTRUCTIONS}]
+                    repeated = urllib.request.Request(self.server.relay + '/chat/completions',
+                        data=json.dumps(retry_chat).encode(), headers=headers)
+                    return self.server.opener.open(repeated, timeout=60)
+
                 with self.server.opener.open(req, timeout=60) as upstream:
-                    events = (compact_events(upstream, model, mapping, self.server.context_store) if compact
+                    events = (compact_events(upstream, model, mapping, self.server.context_store,
+                                             retry=retry_summary, audit=self.audit) if compact
                               else relay_events(upstream, model, mapping))
                     if body.get('stream'):
                         self.send_response(200)
@@ -565,6 +619,9 @@ class Handler(BaseHTTPRequestHandler):
                         self.end_headers()
                         self.close_connection, streamed = True, True
                         for event in events:
+                            if event.get('response'):
+                                stream_response = event['response']
+                            stream_sequence = max(stream_sequence, event.get('sequence_number', -1))
                             data = ('event: ' + event['type'] + '\ndata: ' + json.dumps(event, ensure_ascii=False) + '\n\n').encode()
                             self.wfile.write(data)
                             self.wfile.flush()
@@ -610,7 +667,9 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             self.audit(route='client_disconnected')
         except Exception as exc:
-            code = exc.code if isinstance(exc, urllib.error.HTTPError) else 400 if isinstance(exc, (ProtocolError, ValueError)) else 502
+            code = (exc.code if isinstance(exc, urllib.error.HTTPError) else
+                    502 if isinstance(exc, CompactionError) else
+                    400 if isinstance(exc, (ProtocolError, ValueError)) else 502)
             # Never log upstream response bodies, prompts, headers, or exception URLs/tokens.
             message = str(exc) if isinstance(exc, ProtocolError) else 'Upstream HTTP ' + str(code) if isinstance(exc, urllib.error.HTTPError) else type(exc).__name__
             upstream_code = None
@@ -631,8 +690,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.audit(route='unsupported_input_schema', items=[shape(i) for i in body.get('input', []) if i.get('type') not in ('message', 'reasoning', 'function_call', 'function_call_output', 'custom_tool_call', 'custom_tool_call_output')])
             if streamed:
                 event = {'type': 'error', 'message': message, 'code': 'bridge_error'}
+                if stream_response is not None:
+                    # Codex only interprets a few special top-level "error"
+                    # events. A native failure terminal preserves the actual
+                    # cause instead of becoming "stream closed before ...".
+                    failed = dict(stream_response)
+                    failed.update(status='failed', output=[],
+                                  error={'code': 'bridge_error', 'message': message})
+                    event = {'type': 'response.failed', 'sequence_number': stream_sequence + 1,
+                             'response': failed}
                 try:
-                    self.wfile.write(('event: error\ndata: ' + json.dumps(event) + '\n\n').encode())
+                    self.wfile.write(('event: ' + event['type'] + '\ndata: ' + json.dumps(event) + '\n\n').encode())
                     self.wfile.flush()
                 except OSError:
                     pass
@@ -693,6 +761,7 @@ def serve(args):
         server.server_close()
         raise SystemExit('CODEX_BRIDGE_TOKEN must be supplied to the gateway')
     server.catalog, server.max_output = catalog, args.max_output
+    server.max_compaction_output = getattr(args, 'max_compaction_output', COMPACTION_MAX_OUTPUT)
     server.gpt_models = {m['slug'] for m in catalog['models'] if m['slug'].startswith('gpt-') or m['slug'] == 'codex-auto-review'}
     server.audit_path, server.audit_lock = args.audit, threading.Lock()
     temporary_contexts = None
@@ -742,6 +811,8 @@ if __name__ == '__main__':
     parser.add_argument('--audit')
     parser.add_argument('--context-store', help='Private persistent directory for opaque DeepSeek compaction summaries')
     parser.add_argument('--max-output', type=int, default=8192)
+    parser.add_argument('--max-compaction-output', type=int, default=COMPACTION_MAX_OUTPUT,
+                        help='Independent output budget for summaries (ordinary task replies are unchanged)')
     parser.add_argument('--follow-pid', type=int, help='Exit when the launcher process disappears')
     parser.add_argument('--launchd-socket', help='macOS launchd socket entry name')
     parser.add_argument('--systemd-socket', action='store_true', help='Linux systemd socket activation')

@@ -226,6 +226,71 @@ class RoutingTests(unittest.TestCase):
         cm.exception.close()
         self.assertEqual(len(self.server.opener.requests),2)
 
+    def test_summary_budget_is_independent_of_ordinary_output_limit(self):
+        with self.request('ds', body={'max_output_tokens': 256}) as response:
+            json.load(response)
+        self.assertEqual(json.loads(self.server.opener.requests[-1].data)['max_tokens'], 256)
+        with self.request('ds', body={'max_output_tokens': 256,
+                'input': [{'role': 'user', 'content': 'Task'}, {'type': 'compaction_trigger'}]}) as response:
+            self.assertEqual(json.load(response)['status'], 'completed')
+        summary_request = json.loads(self.server.opener.requests[-1].data)
+        self.assertEqual(summary_request['max_tokens'], 16384)
+        self.assertEqual(summary_request['reasoning_effort'], 'high')
+        self.assertNotIn('tools', summary_request)
+        with self.request('ds') as response:
+            json.load(response)
+        self.assertEqual(json.loads(self.server.opener.requests[-1].data)['max_tokens'], 8192)
+
+    def scripted_compaction(self, finishes):
+        requests = self.server.opener.requests
+        def opened(req, **_):
+            requests.append(req)
+            finish = finishes[len(requests) - 1]
+            raw = upstream({'choices': [{'delta': {'content': 'fixture summary'},
+                                        'finish_reason': finish}]})
+            return FakeUpstream(raw.getvalue())
+        self.server.opener.open = opened
+
+    def test_http_summary_retry_uses_original_history_and_shorter_prompt(self):
+        self.scripted_compaction(['length', 'stop'])
+        with self.request('ds', body={'input': [
+                {'role': 'user', 'content': 'Original task marker 731'},
+                {'type': 'compaction_trigger'}]}) as response:
+            compacted = json.load(response)
+        self.assertEqual(compacted['status'], 'completed')
+        self.assertEqual(len(self.server.opener.requests), 2)
+        first, retry = [json.loads(r.data) for r in self.server.opener.requests]
+        self.assertEqual(first['messages'][:-1], retry['messages'][:-1])
+        self.assertIn('at most 2000 tokens', retry['messages'][-1]['content'])
+        self.assertEqual(retry['max_tokens'], 16384)
+        self.assertNotIn('tools', retry)
+        self.assertEqual(len(list(self.server.context_store.directory.iterdir())), 1)
+
+    def test_streamed_compaction_failure_is_a_native_terminal_not_a_silent_eof(self):
+        self.scripted_compaction(['length', 'length'])
+        with self.request('ds', body={'stream': True,
+                'input': [{'role': 'user', 'content': 'Task'}, {'type': 'compaction_trigger'}]}) as response:
+            events = [json.loads(line[6:]) for line in response if line.startswith(b'data: ')]
+        self.assertEqual(events[-1]['type'], 'response.failed')
+        failed = events[-1]['response']
+        self.assertEqual(failed['status'], 'failed')
+        self.assertEqual(failed['id'], events[0]['response']['id'])
+        self.assertIn('summary output limit', failed['error']['message'])
+        self.assertNotIn('response.completed', [e['type'] for e in events])
+        self.assertEqual(len(self.server.opener.requests), 2)
+        self.assertEqual(list(self.server.context_store.directory.iterdir()), [])
+
+    def test_nonstream_compaction_failure_reports_upstream_failure_and_preserves_history(self):
+        self.scripted_compaction(['length', 'length'])
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            self.request('ds', body={'input': [
+                {'role': 'user', 'content': 'Task'}, {'type': 'compaction_trigger'}]})
+        self.assertEqual(cm.exception.code, 502)
+        body = json.loads(cm.exception.read())
+        cm.exception.close()
+        self.assertIn('original context was not compacted', body['error']['message'])
+        self.assertEqual(list(self.server.context_store.directory.iterdir()), [])
+
 
 if __name__ == '__main__':
     unittest.main()
