@@ -31,7 +31,9 @@ python3 install.py --relay https://YOUR-RELAY.example/v1
 
 - 默认思考等级：`high`；可选 `low / high / max`。网关实际发送 `thinking.type=enabled` 与 `reasoning_effort`，不是只修改菜单。
 - 默认有效上下文：500000 tokens；自动压缩阈值：400000；每次输出上限：8192。中转站必须实际支持相应容量与输出限制，元数据不会扩大模型容量。
-- DeepSeek 角色使用本地摘要压缩，不依赖中转站实现 Responses 压缩接口。32k/16k 测试中，压缩后继续工具任务、保留早期校验信息与同一子代理追问均已通过；500k 上限未做容量测试。
+- 共享 provider 显式启用官方远程压缩协议（`capabilities.remote_compaction = "v2"`）：GPT 请求原样转给官方，DeepSeek 的 `compaction_trigger` 则由网关转换为 Chat 摘要请求。这里的 v2 指压缩协议，多代理仍使用 v1。
+- 当前 Codex 会忽略角色文件的 provider 切换，不能靠给角色写 `model_provider` 隔离压缩能力。网关按请求中的模型处理：DeepSeek 摘要保存在本机私有 `contexts/` 目录，向 Codex 返回随机不透明引用，下次请求再恢复摘要。该引用不是 OpenAI 密文，也不包含摘要正文；摘要文件为本机明文，目录 0700、文件 0600。
+- 明确选择 `deepseek` 角色以获得对应模型与任务约束。32k/16k 测试已验证 DeepSeek 连续压缩后继续工具任务并保留早期校验信息，以及同一父会话的 GPT 远程压缩；500k 上限未做容量测试。
 - 压缩会改变输入前缀，可能降低缓存命中。缓存由上游管理；网关不保存 KV 缓存。
 - 混合目录使用 Codex v1 工具式多代理。v2 加密任务正文无法被第三方模型读取，网关会明确拒绝。
 
@@ -69,11 +71,13 @@ python3 ~/.codex/deepseek-bridge/manage.py uninstall
 
 macOS API Key 保存在钥匙串；Linux API Key 保存在安装目录的 `relay.key`（用户所有、权限 0600），不是加密存储。Linux 用户服务默认随用户会话运行；本项目不会自动启用 linger 或修改系统级服务。
 
+`contexts/` 含 DeepSeek 压缩后的任务摘要，不要提交或公开。按需网关退出后可以重启并继续读取这些记录；若要迁移已压缩的 DeepSeek 会话，需要另行安全迁移对应本地记录，单独克隆 Git 仓库不能恢复摘要。记录丢失、引用未知或模型不匹配时明确报错，不会当作空上下文继续。卸载保留的安装目录也可能仍含这些摘要。
+
 ## 凭证与协议边界
 
 GPT 请求只转发到官方 ChatGPT Codex 后端，保留该设备 ChatGPT 登录态。DeepSeek 请求重新构造认证头，只携带中转 Key，不转发 ChatGPT token、账户 ID 或 Cookie；禁止重定向，未知模型拒绝路由。
 
-目前支持文本、函数工具及 `apply_patch` 转换；DeepSeek 不支持图片、官方服务端网页搜索、WebSocket 增量续聊或服务端压缩端点。独立 CLI 禁用个人 MCP、插件和记忆；桌面安装中这些能力由 GPT 主代理保留，DeepSeek 角色禁用。上游故障、截断和断流会明确报告。
+目前支持文本、函数工具及 `apply_patch` 转换；DeepSeek 不支持图片、官方服务端网页搜索、WebSocket 增量续聊或原厂 `/responses/compact` 端点。它通过本机适配支持 `/responses` 上的内联压缩协议。独立 CLI 禁用个人 MCP、插件和记忆；桌面安装中这些能力由 GPT 主代理保留，DeepSeek 角色禁用。上游故障、截断和断流会明确报告。
 
 仓库不包含模型目录快照、个人配置、API Key、认证文件或历史会话。安装时从目标设备 Codex 的模型目录生成本地目录，并为 DeepSeek 添加元数据。请勿提交安装目录、会话日志或备份。
 

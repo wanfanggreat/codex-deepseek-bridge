@@ -39,7 +39,8 @@ def main():
         relay=settings['relay'], model='deepseek-v4.1-flash', catalog=str(root/'models.json'),
         port=settings['port'], launchd_socket='Listener' if settings['platform']=='darwin' else None,
         systemd_socket=settings['platform']=='linux', follow_pid=None,
-        audit=str(root/'logs/gateway.jsonl'), max_output=8192, idle_timeout=90))
+        audit=str(root/'logs/gateway.jsonl'), max_output=8192, idle_timeout=90,
+        context_store=str(root/'contexts')))
 
 
 if __name__ == '__main__':

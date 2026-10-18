@@ -2,12 +2,17 @@
 """Loopback-only Codex Responses -> Chat Completions bridge (stdlib only)."""
 import argparse
 import ctypes
+import hashlib
 import json
 import hmac
 import os
+import pathlib
+import re
+import secrets
 import socket
 import sys
 import threading
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -22,6 +27,107 @@ HOP = {'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
 
 class ProtocolError(ValueError):
     pass
+
+
+class ContextStore:
+    """Private local summaries addressed by random, model-bound opaque tokens."""
+    prefix = 'dsctx_v1_'
+
+    def __init__(self, directory):
+        self.directory = pathlib.Path(directory)
+        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if self.directory.is_symlink() or self.directory.stat().st_mode & 0o077:
+            raise ProtocolError('Compaction context directory must be private (0700)')
+
+    def put(self, model, summary):
+        token = self.prefix + secrets.token_urlsafe(32)
+        path = self.directory / (hashlib.sha256(token.encode()).hexdigest() + '.json')
+        value = json.dumps({'model': model, 'summary': summary, 'created_at': int(time.time())}).encode()
+        with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as f:
+            f.write(value)
+        return token
+
+    def get(self, token, model):
+        if not isinstance(token, str) or not re.fullmatch(r'dsctx_v1_[A-Za-z0-9_-]{43}', token):
+            raise ProtocolError('Foreign or invalid compaction state; use a fresh DeepSeek agent')
+        path = self.directory / (hashlib.sha256(token.encode()).hexdigest() + '.json')
+        try:
+            if path.is_symlink() or path.stat().st_mode & 0o077 or path.stat().st_size > 1024 * 1024:
+                raise ProtocolError('Compaction context file is not private or is invalid')
+            value = json.loads(path.read_text())
+        except FileNotFoundError:
+            raise ProtocolError('Local DeepSeek compaction state is missing; restore contexts or start a fresh agent') from None
+        except (ValueError, OSError):
+            raise ProtocolError('Local DeepSeek compaction state is unreadable') from None
+        if value.get('model') != model or not isinstance(value.get('summary'), str) or not value['summary'].strip():
+            raise ProtocolError('Compaction state model mismatch or empty summary')
+        return value['summary']
+
+
+def prepare_context(body, store, model):
+    """Resolve provider-owned summaries and detect a native V2 compact request."""
+    if isinstance(body.get('input'), str):
+        return body, False
+    result = dict(body)
+    items, compact = [], False
+    for item in body.get('input', []):
+        kind = item.get('type', 'message')
+        if kind == 'compaction_trigger':
+            if compact:
+                raise ProtocolError('Multiple compaction triggers are unsupported')
+            compact = True
+        elif kind in ('compaction', 'context_compaction'):
+            if store is None:
+                raise ProtocolError('A persistent context store is required for DeepSeek compaction')
+            summary = store.get(item.get('encrypted_content'), model)
+            items.append({'type': 'message', 'role': 'user',
+                          'content': 'Context summary retained by the local DeepSeek bridge:\n' + summary})
+        else:
+            items.append(item)
+    result['input'] = items
+    if compact:
+        if store is None:
+            raise ProtocolError('A context store is required for DeepSeek compaction')
+        result['tools'] = []
+        result['tool_choice'] = 'none'
+        items.append({'type': 'message', 'role': 'user', 'content':
+            'Perform context compaction only. Do not continue the task or call tools. '
+            'Write a self-contained handoff summary preserving the actual objective, constraints, '
+            'completed and pending work, exact paths and identifiers, verified evidence, unresolved '
+            'issues, and important facts or markers needed to continue. Distinguish facts from guesses. '
+            'Return only this summary; do not reveal private reasoning.'})
+    return result, compact
+
+
+def compact_events(upstream, model, mapping, store):
+    """Adapt Chat summarization to native Responses V2 compaction events."""
+    identity = 'resp_' + uuid.uuid4().hex
+    response = {'id': identity, 'object': 'response', 'created_at': int(time.time()),
+                'status': 'in_progress', 'model': model, 'output': [],
+                'usage': None, 'error': None, 'incomplete_details': None}
+    yield {'type': 'response.created', 'sequence_number': 0, 'response': dict(response)}
+    yield {'type': 'response.in_progress', 'sequence_number': 1, 'response': dict(response)}
+    final = None
+    last_heartbeat = time.monotonic()
+    for event in relay_events(upstream, model, mapping):
+        if time.monotonic() - last_heartbeat >= 10:
+            yield {'type': 'keepalive'}
+            last_heartbeat = time.monotonic()
+        if event['type'] in ('response.completed', 'response.incomplete'):
+            final = event['response']
+    if not final or final['status'] != 'completed':
+        raise ProtocolError('DeepSeek compaction was truncated; original context was not compacted')
+    if any(i['type'] not in ('message', 'reasoning') for i in final['output']):
+        raise ProtocolError('DeepSeek compaction attempted a tool call')
+    summary = '\n'.join(text_content(i.get('content')) for i in final['output'] if i['type'] == 'message').strip()
+    if not summary:
+        raise ProtocolError('DeepSeek compaction returned no summary')
+    token = store.put(model, summary)
+    item = {'type': 'compaction', 'id': 'cmp_' + uuid.uuid4().hex, 'encrypted_content': token}
+    yield {'type': 'response.output_item.added', 'sequence_number': 2, 'output_index': 0, 'item': dict(item)}
+    yield {'type': 'response.output_item.done', 'sequence_number': 3, 'output_index': 0, 'item': dict(item)}
+    response.update(status='completed', output=[item], usage=final.get('usage'))
+    yield {'type': 'response.completed', 'sequence_number': 4, 'response': response}
 
 
 def text_content(content):
@@ -360,7 +466,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == '/health':
-            return self.json_response(200, {'status': 'ok', 'deepseek_model': self.server.model})
+            return self.json_response(200, {'status': 'ok', 'deepseek_model': self.server.model,
+                                           'deepseek_inline_compaction': True})
         if self.path.split('?')[0] == '/models':
             if not self.authorized():
                 return
@@ -384,7 +491,8 @@ class Handler(BaseHTTPRequestHandler):
             if model == self.server.model:
                 if self.path.split('?')[0] != '/responses':
                     raise ProtocolError('DeepSeek server-side compaction is unsupported')
-                chat, mapping = to_chat(body, self.server.model, self.server.max_output)
+                prepared, compact = prepare_context(body, getattr(self.server, 'context_store', None), self.server.model)
+                chat, mapping = to_chat(prepared, self.server.model, self.server.max_output)
                 # Construct relay headers from scratch. ChatGPT auth/identity never crosses this branch.
                 headers = {'Authorization': 'Bearer ' + self.server.api_key,
                            'Content-Type': 'application/json', 'Accept': 'text/event-stream',
@@ -395,10 +503,12 @@ class Handler(BaseHTTPRequestHandler):
                            tool_count=len(mapping), tool_names=list(mapping),
                            reasoning_effort_forwarded=chat['reasoning_effort'],
                            thinking_type=chat['thinking']['type'],
+                           compaction_request=compact,
                            excluded_hosted_tools=[t['type'] for t in body.get('tools', []) if t.get('type') in ('web_search', 'web_search_preview')],
                            upstream='chat/completions', chatgpt_headers_forwarded=False)
                 with self.server.opener.open(req, timeout=60) as upstream:
-                    events = relay_events(upstream, model, mapping)
+                    events = (compact_events(upstream, model, mapping, self.server.context_store) if compact
+                              else relay_events(upstream, model, mapping))
                     if body.get('stream'):
                         self.send_response(200)
                         self.send_header('Content-Type', 'text/event-stream')
@@ -422,6 +532,10 @@ class Handler(BaseHTTPRequestHandler):
                                 final = event['response']
                         self.json_response(200, final)
             elif model in self.server.gpt_models:
+                if isinstance(body.get('input'), list) and any(
+                    isinstance(i.get('encrypted_content'), str) and i['encrypted_content'].startswith(ContextStore.prefix)
+                    for i in body['input']):
+                    raise ProtocolError('DeepSeek compaction state cannot be sent to GPT; use a fresh agent')
                 headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP and not k.lower().startswith('x-bridge-')}
                 headers['Accept-Encoding'] = 'identity'
                 req = urllib.request.Request('https://chatgpt.com/backend-api/codex' + self.path, data=raw, headers=headers)
@@ -533,6 +647,12 @@ def serve(args):
     server.catalog, server.max_output = catalog, args.max_output
     server.gpt_models = {m['slug'] for m in catalog['models'] if m['slug'].startswith('gpt-') or m['slug'] == 'codex-auto-review'}
     server.audit_path, server.audit_lock = args.audit, threading.Lock()
+    temporary_contexts = None
+    context_path = getattr(args, 'context_store', None)
+    if context_path is None:
+        temporary_contexts = tempfile.TemporaryDirectory(prefix='codex-deepseek-contexts-')
+        context_path = temporary_contexts.name
+    server.context_store = ContextStore(context_path)
     # No redirects: a gateway must never forward credentials to a redirected host.
     class NoRedirect(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, *unused):
@@ -561,6 +681,8 @@ def serve(args):
         pass
     finally:
         server.server_close()
+        if temporary_contexts is not None:
+            temporary_contexts.cleanup()
 
 
 if __name__ == '__main__':
@@ -570,6 +692,7 @@ if __name__ == '__main__':
     parser.add_argument('--model', default='deepseek-v4.1-flash')
     parser.add_argument('--catalog', required=True)
     parser.add_argument('--audit')
+    parser.add_argument('--context-store', help='Private persistent directory for opaque DeepSeek compaction summaries')
     parser.add_argument('--max-output', type=int, default=8192)
     parser.add_argument('--follow-pid', type=int, help='Exit when the launcher process disappears')
     parser.add_argument('--launchd-socket', help='macOS launchd socket entry name')

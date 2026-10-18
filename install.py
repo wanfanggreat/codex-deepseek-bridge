@@ -89,8 +89,8 @@ def make_config(original, root, token, port):
                       'requires_openai_auth = true\nsupports_websockets = false\n'
                       'request_max_retries = 1\nstream_max_retries = 0\n'
                       f'http_headers = {{ "X-Bridge-Key" = "{token}" }}\n')
-        if name == 'local_deepseek_chat':
-            providers += f'[model_providers.{name}.capabilities]\nremote_compaction = "unsupported"\n'
+        compaction = 'unsupported' if name == 'local_deepseek_chat' else 'v2'
+        providers += f'[model_providers.{name}.capabilities]\nremote_compaction = "{compaction}"\n'
     maximum = max(2, parsed.get('agents', {}).get('max_concurrent_threads_per_session', 2))
     tables = (TABLE_START+providers+'[agents]\n'+body
               +'\nenabled = true\nmax_concurrent_threads_per_session = '+str(maximum)
@@ -218,7 +218,7 @@ def main():
         atomic_write(root/'models.json',(json.dumps(catalog,ensure_ascii=False,indent=2)+'\n').encode())
         atomic_write(root/'settings.json',(json.dumps(settings,indent=2)+'\n').encode())
         atomic_write(root/'gateway.token',(token+'\n').encode())
-        atomic_write(root/'deepseek-agent.toml',b'model = "deepseek-v4.1-flash"\nmodel_provider = "local_deepseek_chat"\nweb_search = "disabled"\n[features]\napps = false\nplugins = false\nmemories = false\n')
+        atomic_write(root/'deepseek-agent.toml',b'model = "deepseek-v4.1-flash"\nweb_search = "disabled"\n[features]\napps = false\nplugins = false\nmemories = false\n')
         if sys.platform=='darwin':
             existing = subprocess.run(['/usr/bin/security','find-generic-password','-a',settings['keychain_account'],
                                        '-s',settings['keychain_service'],'-w'],capture_output=True)

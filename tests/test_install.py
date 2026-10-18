@@ -17,7 +17,7 @@ import bridge
 from desktop_service import load_key
 from install import make_config, render_services, validate_relay
 from manage import restored_config
-from launch import build_catalog
+from launch import build_catalog, provider_overrides
 
 
 class InstallTests(unittest.TestCase):
@@ -41,7 +41,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(parsed['agents']['default_subagent_reasoning_effort'],'high')
         self.assertEqual(parsed['mcp_servers'],tomllib.loads(old)['mcp_servers'])
         self.assertEqual(parsed['model_providers']['local_deepseek_chat']['capabilities']['remote_compaction'],'unsupported')
-        self.assertNotIn('capabilities',parsed['model_providers']['local_deepseek_bridge'])
+        self.assertEqual(parsed['model_providers']['local_deepseek_bridge']['capabilities']['remote_compaction'],'v2')
         self.assertEqual(restored_config(content,state,old.encode()),old.encode())
 
     def test_uninstall_preserves_later_unrelated_preferences(self):
@@ -159,6 +159,13 @@ class InstallTests(unittest.TestCase):
             self.assertEqual(model['context_window'],500000)
             self.assertEqual(model['default_reasoning_level'],'high')
             self.assertEqual(list(pathlib.Path(temp).iterdir()),[])
+
+    def test_cli_gpt_and_deepseek_compaction_providers_are_independent(self):
+        settings = provider_overrides(24589)
+        self.assertEqual(settings['model_providers.deepseek_bridge.capabilities.remote_compaction'],'v2')
+        self.assertEqual(settings['model_providers.deepseek_chat.capabilities.remote_compaction'],'unsupported')
+        self.assertEqual(settings['model_providers.deepseek_bridge.base_url'],
+                         settings['model_providers.deepseek_chat.base_url'])
 
 
 if __name__=='__main__':

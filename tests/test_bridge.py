@@ -1,11 +1,13 @@
 """Protocol and credential-boundary tests; no live API requests."""
 import io
 import json
+import pathlib
+import tempfile
 import threading
 import unittest
 import urllib.error
 import urllib.request
-from bridge import Gateway, Handler, ProtocolError, convert_usage, relay_events, to_chat
+from bridge import ContextStore, Gateway, Handler, ProtocolError, convert_usage, relay_events, to_chat
 
 
 def upstream(*chunks):
@@ -142,6 +144,8 @@ class RoutingTests(unittest.TestCase):
         self.server.gpt_models = {'gpt-test'}
         self.server.audit_path, self.server.audit_lock = None, threading.Lock()
         self.server.opener = CaptureOpener()
+        self.context_temp = tempfile.TemporaryDirectory()
+        self.server.context_store = ContextStore(pathlib.Path(self.context_temp.name)/'contexts')
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
 
@@ -149,10 +153,14 @@ class RoutingTests(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join()
+        self.context_temp.cleanup()
 
-    def request(self, model, token='local-capability'):
+    def request(self, model, token='local-capability', body=None):
+        payload = {'model': model, 'input': 'x', 'stream': False}
+        if body:
+            payload.update(body)
         req = urllib.request.Request('http://127.0.0.1:' + str(self.server.server_port) + '/responses',
-              data=json.dumps({'model': model, 'input': 'x', 'stream': False}).encode(),
+              data=json.dumps(payload).encode(),
               headers={'Content-Type': 'application/json', 'Authorization': 'Bearer fake-chatgpt-token',
                        'ChatGPT-Account-ID': 'fake-account', 'Cookie': 'fake-cookie', 'X-Bridge-Key': token})
         return urllib.request.urlopen(req, timeout=5)
@@ -199,6 +207,24 @@ class RoutingTests(unittest.TestCase):
         cm.exception.close()
         self.assertIn('system_memory_overloaded', body)
         self.assertNotIn('fake-relay-secret', body)
+
+    def test_native_compaction_http_then_continuation(self):
+        with self.request('ds',body={'input':[{'role':'user','content':'Summarize task'},
+                                             {'type':'compaction_trigger'}]}) as response:
+            compacted=json.load(response)
+        item=compacted['output'][0]
+        self.assertEqual(item['type'],'compaction')
+        self.assertEqual(len(self.server.opener.requests),1)
+        with self.request('ds',body={'input':[item,{'role':'user','content':'Continue'}]}) as response:
+            self.assertEqual(json.load(response)['status'],'completed')
+        replay=json.loads(self.server.opener.requests[-1].data)
+        self.assertIn('Context summary retained',replay['messages'][0]['content'])
+        self.assertNotIn(item['encrypted_content'],json.dumps(replay))
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            self.request('gpt-test',body={'input':[item]})
+        self.assertEqual(cm.exception.code,400)
+        cm.exception.close()
+        self.assertEqual(len(self.server.opener.requests),2)
 
 
 if __name__ == '__main__':

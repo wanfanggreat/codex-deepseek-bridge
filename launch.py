@@ -48,7 +48,8 @@ def build_catalog(codex):
                       'tool_mode': None, 'prefer_websockets': False})
             messages = m.setdefault('model_messages', {})
             hint = ('When native subagent tools are deferred, discover them with tool_search '
-                    'before concluding that delegation is unavailable.')
+                    'before concluding that delegation is unavailable. '
+                    'For deepseek-v4.1-flash, select the deepseek agent role.')
             if isinstance(messages, dict):
                 messages['persistent_instructions'] = (messages.get('persistent_instructions') or '') + '\n' + hint
     base = copy.deepcopy(next(m for m in catalog['models'] if m['slug'] == 'gpt-6.1-sol'))
@@ -79,6 +80,24 @@ def build_catalog(codex):
     return catalog
 
 
+def provider_overrides(port):
+    result = {}
+    for name, compaction in [('deepseek_bridge', 'v2'), ('deepseek_chat', 'unsupported')]:
+        prefix = 'model_providers.' + name + '.'
+        result.update({
+            prefix + 'name': 'Local GPT + DeepSeek bridge',
+            prefix + 'base_url': 'http://127.0.0.1:' + str(port),
+            prefix + 'wire_api': 'responses',
+            prefix + 'requires_openai_auth': True,
+            prefix + 'env_http_headers': {'X-Bridge-Key': 'CODEX_BRIDGE_TOKEN'},
+            prefix + 'supports_websockets': False,
+            prefix + 'request_max_retries': 0,
+            prefix + 'stream_max_retries': 0,
+            prefix + 'capabilities.remote_compaction': compaction,
+        })
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--model', default='gpt-6.1-sol', choices=['gpt-6.1-sol', 'deepseek-v4.1-flash'])
@@ -106,6 +125,9 @@ def main():
     runtime = pathlib.Path(tempfile.mkdtemp(prefix='codex-deepseek-'))
     catalog_path = runtime / 'models.json'
     catalog_path.write_text(json.dumps(build_catalog(codex), ensure_ascii=False))
+    role_path = runtime / 'deepseek-agent.toml'
+    role_path.write_text('model = "deepseek-v4.1-flash"\n'
+                         'web_search = "disabled"\n[features]\napps = false\nplugins = false\nmemories = false\n')
     audit_dir = args.audit_dir
     if audit_dir:
         audit_dir.mkdir(parents=True, exist_ok=True)
@@ -114,7 +136,8 @@ def main():
     token = secrets.token_urlsafe(32)
     gateway_env['CODEX_BRIDGE_TOKEN'] = token
     gateway_args = [sys.executable, str(ROOT / 'bridge.py'), '--port', '0', '--relay', args.relay,
-                    '--catalog', str(catalog_path), '--follow-pid', str(os.getpid())]
+                    '--catalog', str(catalog_path), '--follow-pid', str(os.getpid()),
+                    '--context-store', str(runtime / 'contexts')]
     if audit_dir:
         gateway_args += ['--audit', str(audit_dir / 'gateway.jsonl')]
     gateway = subprocess.Popen(gateway_args, env=gateway_env, stdout=subprocess.PIPE,
@@ -128,27 +151,23 @@ def main():
         # Ignore user configuration so the validation session has no personal MCP,
         # plugins, memories, notifications, or credential-bearing shell environment.
         overrides = {
-            'model': args.model, 'model_provider': 'deepseek_bridge',
+            'model': args.model,
+            'model_provider': 'deepseek_chat' if args.model == 'deepseek-v4.1-flash' else 'deepseek_bridge',
             'model_catalog_json': str(catalog_path),
-            'model_providers.deepseek_bridge.name': 'Local GPT + DeepSeek bridge',
-            'model_providers.deepseek_bridge.base_url': 'http://127.0.0.1:' + str(port),
-            'model_providers.deepseek_bridge.wire_api': 'responses',
-            'model_providers.deepseek_bridge.requires_openai_auth': True,
-            'model_providers.deepseek_bridge.env_http_headers': {'X-Bridge-Key': 'CODEX_BRIDGE_TOKEN'},
-            'model_providers.deepseek_bridge.supports_websockets': False,
-            'model_providers.deepseek_bridge.request_max_retries': 0,
-            'model_providers.deepseek_bridge.stream_max_retries': 0,
             'model_reasoning_effort': 'high' if args.model == 'deepseek-v4.1-flash' else 'low',
             'web_search': 'disabled',
             'agents.enabled': True, 'agents.max_concurrent_threads_per_session': 2,
             'agents.default_subagent_model': 'deepseek-v4.1-flash',
             'agents.default_subagent_reasoning_effort': 'high',
+            'agents.deepseek.description': 'DeepSeek Chat worker with local compaction.',
+            'agents.deepseek.config_file': str(role_path),
             'features.apps': False, 'features.plugins': False, 'features.memories': False,
             'skills.bundled.enabled': False,
             'skills.include_instructions': False,
             'shell_environment_policy.inherit': 'core',
             'approval_policy': 'never',
         }
+        overrides.update(provider_overrides(port))
         command = [codex]
         if args.execute:
             command += ['exec', '--ignore-user-config', '--ignore-rules', '--ephemeral',

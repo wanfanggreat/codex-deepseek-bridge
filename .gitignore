@@ -20,4 +20,5 @@ config.toml
 logs/
 backups/
 audit/
+contexts/
 .DS_Store
