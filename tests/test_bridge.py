@@ -2,6 +2,8 @@
 import io
 import json
 import pathlib
+import socket
+import ssl
 import tempfile
 import threading
 import unittest
@@ -290,6 +292,80 @@ class RoutingTests(unittest.TestCase):
         cm.exception.close()
         self.assertIn('original context was not compacted', body['error']['message'])
         self.assertEqual(list(self.server.context_store.directory.iterdir()), [])
+
+    def test_temporary_dns_failure_before_connect_is_retried_once(self):
+        original_open = self.server.opener.open
+        attempts = []
+        def open_request(req, **kwargs):
+            attempts.append(req)
+            if len(attempts) == 1:
+                raise urllib.error.URLError(socket.gaierror(socket.EAI_AGAIN, 'private DNS detail'))
+            return original_open(req, **kwargs)
+        self.server.opener.open = open_request
+        with self.request('ds') as response:
+            self.assertEqual(json.load(response)['status'], 'completed')
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(attempts[0].data, attempts[1].data)
+
+    def test_refused_connection_retry_is_bounded_and_reports_reason(self):
+        attempts = []
+        def open_request(req, **_):
+            attempts.append(req)
+            raise urllib.error.URLError(ConnectionRefusedError(61, 'private proxy URL'))
+        self.server.opener.open = open_request
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            self.request('gpt-test')
+        self.assertEqual(cm.exception.code, 502)
+        text = cm.exception.read().decode()
+        cm.exception.close()
+        self.assertIn('connection_refused', text)
+        self.assertNotIn('private', text)
+        self.assertEqual(len(attempts), 2)
+
+    def test_tls_failures_are_classified_without_retry_or_secret_exposure(self):
+        attempts = []
+        self.server.audit_path = str(pathlib.Path(self.context_temp.name) / 'audit.jsonl')
+        def open_request(req, **_):
+            attempts.append(req)
+            raise urllib.error.URLError(ssl.SSLEOFError(8, 'private fake-relay-secret URL'))
+        self.server.opener.open = open_request
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            self.request('ds')
+        text = cm.exception.read().decode()
+        cm.exception.close()
+        self.assertIn('tls_eof', text)
+        audit = pathlib.Path(self.server.audit_path).read_text()
+        self.assertIn('SSLEOFError', audit)
+        self.assertNotIn('fake-relay-secret', text + audit)
+        self.assertNotIn('private', text + audit)
+        self.assertEqual(len(attempts), 1)
+
+    def test_resets_and_timeouts_with_uncertain_delivery_are_not_retried(self):
+        for error in (ConnectionResetError(54, 'private'), TimeoutError('private')):
+            attempts = []
+            def open_request(req, **_):
+                attempts.append(req)
+                raise urllib.error.URLError(error)
+            self.server.opener.open = open_request
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                self.request('ds')
+            cm.exception.close()
+            self.assertEqual(len(attempts), 1)
+
+    def test_a_started_response_is_never_replayed(self):
+        attempts = []
+        class BrokenRead(FakeUpstream):
+            def __iter__(self):
+                raise urllib.error.URLError(ConnectionResetError(54, 'private'))
+        def open_request(req, **_):
+            attempts.append(req)
+            return BrokenRead(b'')
+        self.server.opener.open = open_request
+        with self.request('ds', body={'stream': True}) as response:
+            events = [json.loads(line[6:]) for line in response if line.startswith(b'data: ')]
+        self.assertEqual(events[-1]['type'], 'response.failed')
+        self.assertIn('connection_reset', events[-1]['response']['error']['message'])
+        self.assertEqual(len(attempts), 1)
 
 
 if __name__ == '__main__':

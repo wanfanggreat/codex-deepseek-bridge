@@ -10,6 +10,7 @@ import pathlib
 import re
 import secrets
 import socket
+import ssl
 import sys
 import threading
 import tempfile
@@ -31,6 +32,46 @@ class ProtocolError(ValueError):
 
 class CompactionError(ProtocolError):
     """A failed summary must leave the original history intact."""
+
+
+def network_error_details(error):
+    """Fixed categories and numeric diagnostics only; never log reason text."""
+    if isinstance(error, urllib.error.HTTPError):
+        return None
+    if not isinstance(error, (urllib.error.URLError, ConnectionError, TimeoutError,
+                              socket.gaierror, ssl.SSLError)):
+        return None
+    reason = error
+    for _ in range(4):
+        if not isinstance(reason, urllib.error.URLError):
+            break
+        reason = reason.reason
+    category = 'network_error'
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        category = 'tls_certificate_verification'
+    elif isinstance(reason, ssl.SSLEOFError):
+        category = 'tls_eof'
+    elif isinstance(reason, ssl.SSLError):
+        category = 'tls_error'
+    elif isinstance(reason, socket.gaierror):
+        category = 'dns_temporary' if reason.errno == socket.EAI_AGAIN else 'dns_resolution'
+    elif isinstance(reason, ConnectionRefusedError):
+        category = 'connection_refused'
+    elif isinstance(reason, TimeoutError):
+        category = 'timeout'
+    elif isinstance(reason, ConnectionResetError):
+        category = 'connection_reset'
+    elif isinstance(reason, str) and 'tunnel connection failed' in reason.lower():
+        category = 'proxy_tunnel_failure'
+    details = {'category': category, 'reason_type': type(reason).__name__}
+    for attribute in ('errno', 'verify_code'):
+        value = getattr(reason, attribute, None)
+        if isinstance(value, int):
+            details[attribute] = value
+    tls_reason = getattr(reason, 'reason', None)
+    if isinstance(tls_reason, str) and re.fullmatch(r'[A-Z0-9_]{1,80}', tls_reason):
+        details['tls_reason'] = tls_reason
+    return details
 
 
 COMPACTION_MAX_OUTPUT = 16384
@@ -550,6 +591,21 @@ class Handler(BaseHTTPRequestHandler):
         self.close_connection = True
         self.wfile.write(data)
 
+    def open_upstream(self, request, timeout):
+        for attempt in range(2):
+            try:
+                return self.server.opener.open(request, timeout=timeout)
+            except Exception as exc:
+                details = network_error_details(exc)
+                # These two failures establish no connection, so no request
+                # body can have reached the provider. Never retry TLS errors,
+                # write/reset/timeouts or an already-started response here.
+                if attempt or not details or details['category'] not in (
+                        'dns_temporary', 'connection_refused'):
+                    raise
+                self.audit(route='connect_retry', attempt=1, network_error=details)
+                time.sleep(0.25)
+
     def do_GET(self):
         if self.path == '/health':
             return self.json_response(200, {'status': 'ok', 'deepseek_model': self.server.model,
@@ -605,9 +661,9 @@ class Handler(BaseHTTPRequestHandler):
                         {'role': 'user', 'content': COMPACTION_RETRY_INSTRUCTIONS}]
                     repeated = urllib.request.Request(self.server.relay + '/chat/completions',
                         data=json.dumps(retry_chat).encode(), headers=headers)
-                    return self.server.opener.open(repeated, timeout=60)
+                    return self.open_upstream(repeated, timeout=60)
 
-                with self.server.opener.open(req, timeout=60) as upstream:
+                with self.open_upstream(req, timeout=60) as upstream:
                     events = (compact_events(upstream, model, mapping, self.server.context_store,
                                              retry=retry_summary, audit=self.audit) if compact
                               else relay_events(upstream, model, mapping))
@@ -650,7 +706,7 @@ class Handler(BaseHTTPRequestHandler):
                            reasoning_effort=(body.get('reasoning') or {}).get('effort'),
                            multi_agent_schema={k: shape(v) for k, v in body.items() if 'agent' in k},
                            request_field_names=list(body))
-                with self.server.opener.open(req, timeout=180) as upstream:
+                with self.open_upstream(req, timeout=180) as upstream:
                     self.send_response(upstream.status)
                     for k, v in upstream.headers.items():
                         if k.lower() not in HOP:
@@ -672,6 +728,9 @@ class Handler(BaseHTTPRequestHandler):
                     400 if isinstance(exc, (ProtocolError, ValueError)) else 502)
             # Never log upstream response bodies, prompts, headers, or exception URLs/tokens.
             message = str(exc) if isinstance(exc, ProtocolError) else 'Upstream HTTP ' + str(code) if isinstance(exc, urllib.error.HTTPError) else type(exc).__name__
+            network = network_error_details(exc)
+            if network:
+                message = 'Upstream network failure: ' + network['category'] + ' (' + network['reason_type'] + ')'
             upstream_code = None
             if isinstance(exc, urllib.error.HTTPError):
                 try:
@@ -685,7 +744,8 @@ class Handler(BaseHTTPRequestHandler):
                     pass
                 finally:
                     exc.close()
-            self.audit(route='error', status=code, error=message, upstream_code=upstream_code)
+            self.audit(route='error', status=code, error=message, upstream_code=upstream_code,
+                       network_error=network)
             if isinstance(exc, ProtocolError) and 'Unsupported Responses input item' in message:
                 self.audit(route='unsupported_input_schema', items=[shape(i) for i in body.get('input', []) if i.get('type') not in ('message', 'reasoning', 'function_call', 'function_call_output', 'custom_tool_call', 'custom_tool_call_output')])
             if streamed:
